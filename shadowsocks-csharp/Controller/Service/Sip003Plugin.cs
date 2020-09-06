@@ -1,9 +1,9 @@
 ﻿using System;
+using System.Collections.Specialized;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection;
 using Shadowsocks.Model;
 using Shadowsocks.Util.ProcessManagement;
 
@@ -21,7 +21,7 @@ namespace Shadowsocks.Controller.Service
         private bool _started;
         private bool _disposed;
 
-        public static Sip003Plugin CreateIfConfigured(Server server)
+        public static Sip003Plugin CreateIfConfigured(Server server, bool showPluginOutput)
         {
             if (server == null)
             {
@@ -33,10 +33,16 @@ namespace Shadowsocks.Controller.Service
                 return null;
             }
 
-            return new Sip003Plugin(server.plugin, server.plugin_opts, server.server, server.server_port);
+            return new Sip003Plugin(
+                server.plugin,
+                server.plugin_opts,
+                server.plugin_args,
+                server.server,
+                server.server_port,
+                showPluginOutput);
         }
 
-        private Sip003Plugin(string plugin, string pluginOpts, string serverAddress, int serverPort)
+        private Sip003Plugin(string plugin, string pluginOpts, string pluginArgs, string serverAddress, int serverPort, bool showPluginOutput)
         {
             if (plugin == null) throw new ArgumentNullException(nameof(plugin));
             if (string.IsNullOrWhiteSpace(serverAddress))
@@ -48,18 +54,17 @@ namespace Shadowsocks.Controller.Service
                 throw new ArgumentOutOfRangeException("serverPort");
             }
 
-            var appPath = Path.GetDirectoryName(new Uri(Assembly.GetExecutingAssembly().GetName().CodeBase).LocalPath);
-
             _pluginProcess = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = plugin,
+                    Arguments = pluginArgs,
                     UseShellExecute = false,
-                    CreateNoWindow = true,
+                    CreateNoWindow = !showPluginOutput,
                     ErrorDialog = false,
                     WindowStyle = ProcessWindowStyle.Hidden,
-                    WorkingDirectory = appPath ?? Environment.CurrentDirectory,
+                    WorkingDirectory = Program.WorkingDirectory ?? Environment.CurrentDirectory,
                     Environment =
                     {
                         ["SS_REMOTE_HOST"] = serverAddress,
@@ -91,12 +96,43 @@ namespace Shadowsocks.Controller.Service
 
                 _pluginProcess.StartInfo.Environment["SS_LOCAL_HOST"] = LocalEndPoint.Address.ToString();
                 _pluginProcess.StartInfo.Environment["SS_LOCAL_PORT"] = LocalEndPoint.Port.ToString();
-                _pluginProcess.Start();
+                _pluginProcess.StartInfo.Arguments = ExpandEnvironmentVariables(_pluginProcess.StartInfo.Arguments, _pluginProcess.StartInfo.EnvironmentVariables);
+                try
+                {
+                    _pluginProcess.Start();
+                }
+                catch (System.ComponentModel.Win32Exception ex)
+                {
+                    // do not use File.Exists(...), it can not handle the scenarios when the plugin file is in system environment path.
+                    // https://docs.microsoft.com/en-us/windows/win32/seccrypto/common-hresult-values
+                    //if ((uint)ex.ErrorCode == 0x80004005)
+                    //  https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/18d8fbe8-a967-4f1c-ae50-99ca8e491d2d
+                    if (ex.NativeErrorCode == 0x00000002)
+                    {
+                        throw new FileNotFoundException(I18N.GetString("Cannot find the plugin program file"), _pluginProcess.StartInfo.FileName, ex);
+                    }
+                    throw new ApplicationException(I18N.GetString("Plugin Program"), ex);
+                }
                 _pluginJob.AddProcess(_pluginProcess.Handle);
                 _started = true;
             }
 
             return true;
+        }
+
+        public string ExpandEnvironmentVariables(string name, StringDictionary environmentVariables = null)
+        {
+            // Expand the environment variables from the new process itself
+            if (environmentVariables != null)
+            {
+                foreach(string key in environmentVariables.Keys)
+                {
+                    name = name.Replace($"%{key}%", environmentVariables[key], StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            // Also expand the environment variables from current main process (system)
+            name = Environment.ExpandEnvironmentVariables(name);
+            return name;
         }
 
         static int GetNextFreeTcpPort()
